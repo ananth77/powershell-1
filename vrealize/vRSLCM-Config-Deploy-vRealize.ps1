@@ -1,4 +1,5 @@
 # Powershell script to configure vRealize Lifecycle Managerv(vRSLCM), deploy single node vidm
+# and optionally deploy vRA, vRLI and vROPS single/simple deployment
 # 
 # vRSLCM API Browserver - https://code.vmware.com/apis/1161/vrealize-suite-lifecycle-manager
 # vRSLCM API Documentation - https://vdc-download.vmware.com/vmwb-repository/dcr-public/9326d555-f77f-456d-8d8a-095aa4976267/c98dabed-ee9a-42ca-87c7-f859698730d1/vRSLCM-REST-Public-API-for-8.4.0.pdf
@@ -16,8 +17,7 @@
 # 19 Nov 2021 - Updated for 8.6.1 release
 #
 # 22 Dec 2021 - Choose wether to deploy vRA or not
-# 29 Dec 2021 - Configure vRSLCM. Option to deploy vRA
-
+# 29 Dec 2021 - Configure vRSLCM. Option to deploy vRA, vRLI and vROPS
 #################
 ### VARIABLES ###
 #################
@@ -60,7 +60,6 @@ $deployCluster = "dc-mgmt#cls-mgmt" #vSphere Cluster - Notation <datacenter>#<cl
 $deployNetwork = "VMNet1"
 $deployVmFolderName = "vRealize-Beta" #vSphere VM Folder Name
 
-$deployVIDM = $true
 $vidmVmName = "bvidm"
 $vidmHostname = $vidmVMName + "." + $domain
 $vidmIp = "192.168.1.182"
@@ -72,6 +71,20 @@ $vraVmName = "bvra"
 $vraHostname = $vraVMName + "." + $domain
 $vraIp = "192.168.1.185"
 $vraVersion = "8.6.1" # for example 8.6.0, 8.5.1, 8.5.0, 8.4.2
+
+$deployvRLI = $true
+$vrliNFSSourceLocation=$nfsSourceLocation #NFS location where vRLI ova is stored.
+$vrliVmName = "bvrli"
+$vrliHostname = $vrliVmName + "." + $domain
+$vrliIp = "192.168.1.186"
+$vrliVersion = "8.6.2"
+
+$deployvROPS = $true
+$vropsNFSSourceLocation=$nfsSourceLocation #NFS location where vROPS ova is stored.
+$vropsVmName = "bvrops"
+$vropsHostname = $vropsVmName + "." + $domain
+$vropsIp = "192.168.1.187"
+$vropsVersion = "8.6.2"
 
 
 # Allow Selfsigned certificates in powershell
@@ -136,6 +149,7 @@ Connect-VIServer $vCenterServer -User $vcenterUsername -Password $vCenterPasswor
 $vmfolder = Get-Folder -Type VM -Name $deployVmFolderName
 #The Id has the notation Folder-group-<groupId>. For the JSON input we need to strip the first 7 characters
 $deployVmFolderId = $vmfolder.Id.Substring(7) +"(" + $deployVmFolderName + ")"
+#DisConnect-VIServer $vCenterServer -Confirm:$false
 
 
 ##############################
@@ -449,8 +463,12 @@ $CertificateLockerEntry="locker`:certificate`:$certificateId`:$CertificateAlias"
 ### CREATE GLOBAL ENVIRONMENT AND DEPLOY VIDM ###
 #################################################
 
-if ($deployVIDM -eq $true){
-
+#Check if VIDM VM already exist
+if (get-vm -Name $vidmVmName -ErrorAction SilentlyContinue){
+    Write-Host "Check if VM $vidmVmName exists"
+    Write-Host "VM with name $vidmVmName already found. Stopping Deployment" -ForegroundColor White -BackgroundColor Red
+    break
+} 
 # Get all Product Binaries from NFS location
 $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries"
 $data=@"
@@ -530,7 +548,7 @@ $vidmDeployJSON=@"
         "diskMode": "thin",
         "network": "$deployNetwork",
         "masterVidmEnabled": "false",
-        "dns": "$dns1,$dns2",
+        "dns": "$dns1",
         "domain": "$domain",
         "gateway": "$gateway",
         "netmask": "$netmask",
@@ -670,15 +688,17 @@ if ($vidmResize -eq $true) {
     $timer.Stop()
     Write-Host "VIDM Power ON Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
 }
-} #End If $vidmDeploy is true
-else {
-    Write-Host "You have selected to not deploy VIDM" -ForegroundColor Black -BackgroundColor Yellow
-}
 
 
 ##################
 ### DEPLOY VRA ###
 ##################
+if (get-vm -Name $vraVmName -ErrorAction SilentlyContinue) {
+    Write-Host "Check if VM $vraVmName exists"
+    Write-Host "VM with name $vraVmName already found. Stopping Deployment" -ForegroundColor White -BackgroundColor Red
+    break
+}
+
 if ($deployvRA -eq $true)
 {
 Write-Host "Start importing vRA Binaries" -ForegroundColor Black -BackgroundColor Green
@@ -747,7 +767,7 @@ $vraDeployJSON =@"
         "network": "$deployNetwork",
         "folderName": "$deployVmFolderId",
         "masterVidmEnabled": "false",
-        "dns": "$dns1,$dns2",
+        "dns": "$dns1",
         "domain": "$domain",
         "gateway": "$gateway",
         "netmask": "$netmask",
@@ -822,4 +842,381 @@ else {
 }
 # END Deploy vRA
 
-DisConnect-VIServer $vCenterServer -Confirm:$false
+
+###################
+### DEPLOY VRLi ###
+###################
+
+if ($deployvRLI -eq $true)
+{
+Write-Host "Start importing vRLI Binaries" -ForegroundColor Black -BackgroundColor Green
+# Retrieve available Product Binaries from vRLI NFS location
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries"
+$data=@"
+{
+  "sourceLocation" : "$vRLINFSSourceLocation",
+  "sourceType" : "NFS"
+}
+"@
+$response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data
+$vrliova = ($response  | Where-Object {($_.name -like "*Log*") -and ($_.type -eq "install")}).name #Select vRLI OVA Name
+# Import vRLI Product Binaries from NFS location
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries/download"
+$data = @"
+[
+    {
+        "filePath":  "/data/nfsfiles/$vrliova",
+        "name":  "$vrliova",
+        "type":  "install"
+    }
+]
+"@
+try {
+    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data 
+} catch {
+    write-host "Failed to Download from NFS Repo" -ForegroundColor red
+    Write-Host "StatusCode:" $_.Exception.Response.StatusCode.value__
+    Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    break
+}
+$binaryMappingRequestId = $response.requestId
+# Wait until the import has finished
+$uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$binaryMappingRequestId"
+Write-Host "Binary Mapping Import Started at" (get-date -format HH:mm)
+$response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+$Timeout = 3600
+$timer = [Diagnostics.Stopwatch]::StartNew()
+while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
+    Start-Sleep -Seconds 60
+    Write-Host "Binary Mapping Import Status at " (get-date -format HH:mm) $response.state
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+    if ($response.state -eq "FAILED"){
+        Write-Host "FAILED import Binaries " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
+        Break
+    }
+}
+$timer.Stop()
+if ($response.state -eq "COMPLETED"){
+    Write-Host "Binary Mapping Import Status" $response.state -ForegroundColor Black -BackgroundColor Green
+  }
+  else {
+    Write-Host "Binary Mapping Import Status" $response.state -ForegroundColor Black -BackgroundColor Red
+  }
+
+
+# Check if Existing vRealize Environment is already created
+$uri=""
+$response=""
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/$vrslcmProdEnv"
+try {
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+} catch {
+    write-host "Environment does not exist." -ForegroundColor Black -BackgroundColor Yellow
+    break
+}
+if ($response -eq ""){
+    Write-Host "New environment: " $vrslcmProdEnv " will be created" -ForegroundColor Black -BackgroundColor Yellow
+    #$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments" #Create New Environment
+} elseif ($response.status -eq "COMPLETED"){
+    Write-Host "vRLi will be deployed in existing environment: " $vrslcmProdEnv -ForegroundColor Black -BackgroundColor Green
+    $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/$vrslcmProdEnv/products" #Add to existing Environment
+}
+Write-Host "Uri is: $uri" -ForegroundColor Black -BackgroundColor Yellow
+
+# Deploy VRLI
+Write-Host "Start vRLi Deployment" -ForegroundColor Black -BackgroundColor Green
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments"
+$vrliDeployJSON = @"
+{
+    "environmentName": "$vrslcmProdEnv",
+    "infrastructure": {
+      "properties": {
+        "dataCenterVmid": "$dc_vmId",
+        "regionName":"",
+        "zoneName":"",
+        "vCenterName": "$vCenterServer",
+        "vCenterHost": "$vCenterServer",
+        "vcUsername": "$vcenterUsername",
+        "vcPassword": "$vcPasswordLockerEntry",
+        "acceptEULA": "true",
+        "enableTelemetry": "false",
+        "defaultPassword": "$defaultPasswordLockerEntry",
+        "certificate": "$CertificateLockerEntry",
+        "cluster": "$deployCluster",
+        "storage": "$deployDatastore",
+        "resourcePool": "",
+        "diskMode": "thin",
+        "network": "$deployNetwork",
+        "folderName": "$deployVmFolderId",
+        "masterVidmEnabled": "true",
+        "dns": "$dns1,$dns2",
+        "domain": "$domain",
+        "gateway": "$gateway",
+        "netmask": "$netmask",
+        "searchpath": "$domain",
+        "timeSyncMode": "ntp",
+        "ntp": "$ntp1",
+        "isDhcp": "false"
+      }
+    },
+    "products": [
+      {
+        "id": "vrli",
+        "version": "$vrliVersion",
+        "clusterVIP": {
+          "clusterVips": []
+        },
+        "nodes": [
+          {
+            "type": "vrli-master",
+            "properties": {
+              "vmName": "$vrliVmName",
+              "hostName": "$vrliHostname",
+              "ip": "$vrliIp"
+            }
+          }
+       ],
+        "properties": {
+          "nodeSize": "small",
+          "certificate": "$CertificateLockerEntry",
+          "productPassword": "$defaultPasswordLockerEntry",
+          "adminEmail": "$vrslcmAdminEmail",
+          "fipsMode": "false",
+          "licenseRef": "$defaultLicenseLockerEntry",
+          "configureClusterVIP": "false",
+          "affinityRule": "false",
+          "isUpgradeVmCompatibility": "true",
+          "vrliAlwaysUseEnglish": "true",
+          "masterVidmEnabled": "true",
+          "configureAffinitySeparateAll": "true",
+          "timeSyncMode": "ntp",
+          "ntp": "$ntp1"
+        }
+      }
+    ]
+  }
+"@
+try {
+    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $vrliDeployJSON
+} catch {
+    write-host "Failed to create $vrslcmProdEnv Environment" -ForegroundColor red
+    Write-Host "StatusCode:" $_.Exception.Response.StatusCode.value__
+    Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    break
+}
+$vrliRequestId = $response.requestId
+
+# Check vRLI Deployment Request
+$uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$vrliRequestId"
+Write-Host "vRLI Deployment Started at" (get-date -format HH:mm)
+$response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+$Timeout = 7200
+$timer = [Diagnostics.Stopwatch]::StartNew()
+while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
+    Start-Sleep -Seconds 60
+    Write-Host "vRLi Deployment Status at " (get-date -format HH:mm) $response.state
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+    if ($response.state -eq "FAILED"){
+        Write-Host "FAILED to deploy vRLI " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
+        Break
+    }
+}
+$timer.Stop()
+if ($response.state -ne "COMPLETED"){
+    Write-Host "vRLI Deployment Status at " (get-date -format HH:mm) $response.state -ForegroundColor White -BackgroundColor Red
+}
+else {
+    Write-Host "vRLI Deployment Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green    
+}
+
+
+### END DEPLOY VRLI
+}
+
+
+######################
+# Start Deploy vROPS #
+######################
+if ($deployvROPS -eq $true)
+{
+
+# Retrieve available Product Binaries from vRLI NFS location
+Write-Host "Start importing vROPS Binaries" -ForegroundColor Black -BackgroundColor Green
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries"
+$data=@"
+{
+  "sourceLocation" : "$vROPSNFSSourceLocation",
+  "sourceType" : "NFS"
+}
+"@
+$response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data
+$vropsova = ($response  | Where-Object {($_.name -like "*Operations*") -and ($_.type -eq "install")}).name #Select vRLI OVA Name
+
+# Import vROPS Product Binaries from NFS location
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries/download"
+$data = @"
+[
+    {
+        "filePath":  "/data/nfsfiles/$vropsova",
+        "name":  "$vropsova",
+        "type":  "install"
+    }
+]
+"@
+try {
+    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data 
+} catch {
+    write-host "Failed to Download vROPS from NFS Repo" -ForegroundColor red
+    Write-Host "StatusCode:" $_.Exception.Response.StatusCode.value__
+    Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    break
+}
+$binaryMappingRequestId = $response.requestId
+
+#### Wait until the import has finished ####
+$uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$binaryMappingRequestId"
+Write-Host "Binary Mapping Import Started at" (get-date -format HH:mm)
+$response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+$Timeout = 3600
+$timer = [Diagnostics.Stopwatch]::StartNew()
+while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
+    Start-Sleep -Seconds 60
+    Write-Host "Binary Mapping Import Status at " (get-date -format HH:mm) $response.state
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+    if ($response.state -eq "FAILED"){
+        Write-Host "FAILED import Binaries " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
+        Break
+    }
+}
+$timer.Stop()
+if ($response.state -eq "COMPLETED"){
+    Write-Host "Binary Mapping Import Status" $response.state -ForegroundColor Black -BackgroundColor Green
+  }
+  else {
+    Write-Host "Binary Mapping Import Status" $response.state -ForegroundColor Black -BackgroundColor Red
+  }
+
+# Check if Existing vRealize Environment is already created
+$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/$vrslcmProdEnv"
+try {
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+} catch {
+    write-host "Environment does not exist." -ForegroundColor Black -BackgroundColor Yellow
+    break
+}
+if ($response -eq ""){
+    Write-Host "New environment: " $vrslcmProdEnv " will be created" -ForegroundColor Black -BackgroundColor Yellow
+    #$uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments" #Create New Environment
+} elseif ($response.status -eq "COMPLETED"){
+    Write-Host "vROPS will be deployed in existing environment: " $vrslcmProdEnv -ForegroundColor Black -BackgroundColor Green
+    $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/$vrslcmProdEnv/products" #Add to existing Environment
+}
+Write-Host "Uri is: $uri" -ForegroundColor Black -BackgroundColor Yellow
+Write-Host "Starting vROPS Deployment" -ForegroundColor Black -BackgroundColor Green
+
+#Deploy vROPS
+$vropsDeployJSON = @"
+{
+    "environmentName": "$vrslcmProdEnv",
+    "infrastructure": {
+      "properties": {
+        "dataCenterVmid": "$dc_vmId",
+        "regionName":"",
+        "zoneName":"",
+        "vCenterName": "$vCenterServer",
+        "vCenterHost": "$vCenterServer",
+        "vcUsername": "$vcenterUsername",
+        "vcPassword": "$vcPasswordLockerEntry",
+        "acceptEULA": "true",
+        "enableTelemetry": "false",
+        "defaultPassword": "$defaultPasswordLockerEntry",
+        "certificate": "$CertificateLockerEntry",
+        "cluster": "$deployCluster",
+        "storage": "$deployDatastore",
+        "resourcePool": "",
+        "diskMode": "thin",
+        "network": "$deployNetwork",
+        "folderName": "$deployVmFolderId",
+        "masterVidmEnabled": "false",
+        "dns": "$dns1,$dns2",
+        "domain": "$domain",
+        "gateway": "$gateway",
+        "netmask": "$netmask",
+        "searchpath": "$domain",
+        "timeSyncMode": "ntp",
+        "ntp": "$ntp1",
+        "isDhcp": "false"
+      }
+    },
+    "products": [
+      {
+        "id": "vrops",
+        "version": "$vropsVersion",
+        "clusterVIP": {
+          "clusterVips": []
+        },
+        "nodes": [
+          {
+            "type": "master",
+            "properties": {
+              "vmName": "$vropsVmName",
+              "hostName": "$vropsHostname",
+              "ip": "$vropsIp"
+            }
+          }
+       ],
+        "properties": {
+          "deployOption": "xsmall",
+          "certificate": "$CertificateLockerEntry",
+          "productPassword": "$defaultPasswordLockerEntry",
+          "adminEmail": "$vrslcmAdminEmail",
+          "fipsMode": "false",
+          "licenseRef": "$defaultLicenseLockerEntry",
+          "configureClusterVIP": "false",
+          "masterVidmEnabled": "true",
+          "affinityRule": "false",
+          "configureAffinitySeparateAll": "false",
+          "disableTls": "TLSv1,TLSv1.1",
+          "isCaEnabled": "false",
+          "timeSyncMode": "ntp",
+          "ntp": "$ntp1"
+        }
+      }
+    ]
+  }
+"@
+try {
+    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $vropsDeployJSON #uri depends on if Environment exists
+} catch {
+    write-host "Failed to deploy vROPS in $vrslcmProdEnv Environment" -ForegroundColor White -BackgroundColor Red
+    Write-Host "StatusCode:" $_.Exception.Response.StatusCode.value__
+    Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
+    break
+}
+$vropsRequestId = $response.requestId
+
+# Check vROPS Deployment Request
+$uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$vropsRequestId"
+Write-Host "vROPS Deployment Started at" (get-date -format HH:mm)
+$response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+$Timeout = 7200
+$timer = [Diagnostics.Stopwatch]::StartNew()
+while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
+    Start-Sleep -Seconds 60
+    Write-Host "vROPS Deployment Status at " (get-date -format HH:mm) $response.state
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+    if ($response.state -eq "FAILED"){
+        Write-Host "FAILED to deploy vROPS " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
+        Break
+    }
+}
+$timer.Stop()
+Write-Host "vROPS Deployment Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
+
+### END DEPLOY VROPS
+}
+
+#RESET CA
+#$uri = "https://$vrslcmHostname/lcm/locker/api/certificates/ca"
+#Invoke-RestMethod -Method Patch -Uri $uri -Headers $header
+

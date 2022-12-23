@@ -1,4 +1,7 @@
 # Powershell script to configure vRealize Lifecycle Managerv(vRSLCM), deploy single node vidm
+# and optionally deploy vRA.
+#
+# Check out the script vRSLCM-Deployment.ps1 for initial deployment and OVA distribution
 # 
 # vRSLCM API Browserver - https://code.vmware.com/apis/1161/vrealize-suite-lifecycle-manager
 # vRSLCM API Documentation - https://vdc-download.vmware.com/vmwb-repository/dcr-public/9326d555-f77f-456d-8d8a-095aa4976267/c98dabed-ee9a-42ca-87c7-f859698730d1/vRSLCM-REST-Public-API-for-8.4.0.pdf
@@ -10,13 +13,15 @@
 # - Import license from file
 # - dns/ntp bugfix
 # - renamed some variables
-# 27 Oct 2021
-# - bugfix Change vCenter Password to use Locker Password
-# Import-Module VMware.PowerCLI
+# 27 Oct 2021 - bugfix Change vCenter Password to use Locker Password
 # 19 Nov 2021 - Updated for 8.6.1 release
-#
 # 22 Dec 2021 - Choose wether to deploy vRA or not
-# 29 Dec 2021 - Configure vRSLCM. Option to deploy vRA
+# 29 Dec 2021 - Configure vRSLCM. Deploy VIDM. Option to deploy vRA
+# 19 Jan 2022 - 8.6.2 Upgrade. Moved resize VIDM resources to end.
+# 22 Mar 2022 - 8.7 - Choice to import OVAs from NFS or vRSLCM appliance.
+# 23 Mar 2022 - 8.7 - Small update to add DcLocation Coordinates
+# 11 Apr 2022 - fix issue with generatad cert because of 23 Mar change.
+
 
 #################
 ### VARIABLES ###
@@ -30,49 +35,60 @@ $vrslcmDefaultAccount = "configadmin"
 $vrslcmDefaultAccountPassword = "VMware01!"
 $vrslcmAdminEmail = $vrslcmDefaultAccount + "@" + $domain 
 $vrslcmDcName = "dc-mgmt" #vRSLCM Datacenter Name
-$vrslcmDcLocation = "Rotterdam, South Holland, NL"
+$vrslcmDcLocation = "Rotterdam;South Holland;NL;51.9225;4.47917" # You have to put in the coordinates to make this work
 $vrslcmProdEnv = "vRealize" #Name of the vRSLCM Environment where vRA is deployed
-
 $dns1 = "192.168.1.204"
 $dns2 = "192.168.1.205"
 $ntp1 = "192.168.1.1"
 $gateway = "192.168.1.1"
 $netmask = "255.255.255.0"
 
+#Get Licence key from file or manually enter key below
+#$vrealizeLicense = ABCDE-01234-FGHIJ-56789-KLMNO
 $vrealizeLicense = Get-Content "C:\Private\Homelab\Lics\vRealizeS2019Ent-license.txt"
 $vrealizeLicenseAlias = "vRealizeSuite2019"
 
 # Set $importCert to $true to import your pre generated certs.
 # Configure the paths below to import your existing Certificates
 # If $false is selected, a wildcard certificate will be generated in vRSLCM
-$importCert = $true
+$importCert = $false
 $PublicCertPath = "C:\Private\Homelab\Certs\pub_bvrslcm.cer"
 $PrivateCertPath = "C:\Private\Homelab\Certs\priv_bvrslcm.cer"
 $CertificateAlias = "vRealizeCertificate"
 
+#vCenter Variables
 $vCenterServer = "vcsamgmt.infrajedi.local"
 $vcenterUsername = "administrator@vsphere.local"
 $vCenterPassword = "VMware01!"
-
-$nfsSourceLocation="192.168.1.10:/data/ISO/vRealize/latest" #NFS location where ova files are stored.
 $deployDatastore = "DS01-SSD870-1" #vSphere Datastore to use for deployment
 $deployCluster = "dc-mgmt#cls-mgmt" #vSphere Cluster - Notation <datacenter>#<cluster>
 $deployNetwork = "VMNet1"
 $deployVmFolderName = "vRealize-Beta" #vSphere VM Folder Name
 
+#OVA Variables
+$ovaSourceType = "Local" # Local or NFS
+$ovaSourceLocation="/data/temp" #
+$ovaFilepath = $ovaSourceLocation
+if ($ovaSourceType -eq "NFS"){
+    $ovaSourceLocation="192.168.1.10:/data/ISO/vRealize/latest" #NFS location where ova files are stored.
+	$ovaFilepath="/data/nfsfiles"
+}
+#write-host "value: $OVASourceType $ovaFilepath $OVASourceLocation"
+
+#VIDM Variables
 $deployVIDM = $true
 $vidmVmName = "bvidm"
 $vidmHostname = $vidmVMName + "." + $domain
 $vidmIp = "192.168.1.182"
-$vidmVersion = "3.3.5" # for example 3.3.4, 3.3.5
-$vidmResize = $true
+$vidmVersion = "3.3.5" # for example 3.3.4, 3.3.5 | vRA 8.3 (VIDM 3.3.4), 
+$vidmResize = $false #Note: Doing before vRA deployment will fail vRA8.6+ deployment
 
-$deployvRA = $false
+#vRA Variables
+$deployvRA = $true
 $vraVmName = "bvra"
 $vraHostname = $vraVMName + "." + $domain
 $vraIp = "192.168.1.185"
-$vraVersion = "8.6.1" # for example 8.6.0, 8.5.1, 8.5.0, 8.4.2
-
+$vraVersion = "8.5.0" # for example 8.6.0, 8.5.1, 8.5.0, 8.4.2
 
 # Allow Selfsigned certificates in powershell
 Function Unblock-SelfSignedCert() {
@@ -189,7 +205,6 @@ $defaultPasswordLockerEntry="locker`:password`:$dp_vmid`:default" ##note the esc
 #####################################
 ### Create Datacenter and vCenter ###
 #####################################
-
 # Create Datacenter
 $dcuri = "https://$vrslcmHostname/lcm/lcops/api/v2/datacenters"
 $data =@"
@@ -408,9 +423,9 @@ elseif ($importCert -eq $false) {
     #prep cert inputs derived from $domain and $vrslcmDcLocation variables
     $certo = $domain.Split(".")[0]
     $certoU = $domain.Split(".")[1]
-    $certi = ($vrslcmDcLocation.Split(",")[0]).trim()
-    $certst = ($vrslcmDcLocation.Split(",")[1]).trim()
-    $certc = ($vrslcmDcLocation.Split(",")[2]).trim()
+    $certi = ($vrslcmDcLocation.Split(";")[0]).trim()
+    $certst = ($vrslcmDcLocation.Split(";")[1]).trim()
+    $certc = ($vrslcmDcLocation.Split(";")[2]).trim()
     $certificateData = @"
     {
         "alias": "$CertificateAlias",
@@ -451,32 +466,34 @@ $CertificateLockerEntry="locker`:certificate`:$certificateId`:$CertificateAlias"
 
 if ($deployVIDM -eq $true){
 
-# Get all Product Binaries from NFS location
+Write-Host "VIDM Binaries will be imported from $OVASourceType" -ForegroundColor Black -BackgroundColor Green
+
+# Get all Product Binaries from Source Location
 $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries"
 $data=@"
 {
-  "sourceLocation" : "$nfsSourceLocation",
-  "sourceType" : "NFS"
+  "sourceLocation" : "$OVASourceLocation",
+  "sourceType" : "$OVASourceType"
 }
 "@
 $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data 
 $response
 
-# Import VIDM ova/binary from NFS location
+# Import VIDM Product Binaries from Source location
 $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries/download"
 $data = @"
 [
     {
-        "filePath":  "/data/nfsfiles/vidm.ova",
-        "name":  "vidm.ova",
-        "type":  "install"
+        "filePath": "$ovaFilepath/vidm.ova",
+        "name": "vidm.ova",
+        "type": "install"
     }
 ]
 "@
 try {
     $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data 
 } catch {
-    write-host "Failed to Download from NFS Repo" -ForegroundColor red
+    write-host "Failed to import Binaries from $ovaSourceType" -ForegroundColor red
     Write-Host "StatusCode:" $_.Exception.Response.StatusCode.value__
     Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
     break
@@ -613,67 +630,8 @@ while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -e
 }
 $timer.Stop()
 Write-Host "VIDM Deployment Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
-
-###########################################
-# Downsize VIDM to 2 vCPU | 6 GB          #
-# For Testing / Homelab environment only! #
-###########################################
-
-if ($vidmResize -eq $true) {
-    write-host "VIDM VM will be resized to smallest size. Not supported for production environments"  -ForegroundColor Black -BackgroundColor Yellow
-    # Power OFF VIDM via vRSLCM Request
-    $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/globalenvironment/products/vidm/power-off"
-    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header
-    $vidmPowerOffRequestId = $response.requestId
-    # Check VIDM Power OFF Request
-    $uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$vidmPowerOffRequestId"
-    Write-Host "VIDM Power OFF Started at" (get-date -format HH:mm)
-    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
-    $Timeout = 3600
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
-        Start-Sleep -Seconds 60
-        Write-Host "VIDM Power OFF Status at " (get-date -format HH:mm) $response.state
-        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
-        if ($response.state -eq "FAILED"){
-            Write-Host "FAILED to Power OFF VIDM " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
-            Break
-        }
-    }
-    $timer.Stop()
-    Write-Host "VIDM Power OFF Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
-
-    # Resize VIDM
-    Set-VM -vm $vidmVmName -MemoryGB 8 -NumCpu 2 -Confirm:$false
-    $vidmvm = get-vm -Name $vidmVmName
-    Write-Host "VIDM VM Set to " $vidmVm.NumCpu " vCPU and " $vidmVM.MemoryGB " GB Memory" -ForegroundColor Black -BackgroundColor Green
-
-    #Power ON VIDM
-    $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/globalenvironment/products/vidm/power-on"
-    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header
-    $vidmPowerOnRequestId = $response.requestId
-    # Check VIDM Power ON Request
-    $uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$vidmPowerOnRequestId"
-    Write-Host "VIDM Power ON Started at" (get-date -format HH:mm)
-    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
-    $Timeout = 3600
-    $timer = [Diagnostics.Stopwatch]::StartNew()
-    while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
-        Start-Sleep -Seconds 60
-        Write-Host "VIDM Power ON Status at " (get-date -format HH:mm) $response.state
-        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
-        if ($response.state -eq "FAILED"){
-            Write-Host "FAILED to Power ON VIDM " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
-            Break
-        }
-    }
-    $timer.Stop()
-    Write-Host "VIDM Power ON Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
 }
-} #End If $vidmDeploy is true
-else {
-    Write-Host "You have selected to not deploy VIDM" -ForegroundColor Black -BackgroundColor Yellow
-}
+
 
 
 ##################
@@ -687,16 +645,16 @@ $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/settings/product-binaries/downl
 $data = @"
 [
     {
-        "filePath":  "/data/nfsfiles/vra.ova",
-        "name":  "vra.ova",
-        "type":  "install"
+        "filePath": "$ovaFilepath/vra.ova",
+        "name": "vra.ova",
+        "type": "install"
     }
 ]
 "@
 try {
     $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header -Body $data 
 } catch {
-    write-host "Failed to Download from NFS Repo" -ForegroundColor red
+    write-host "Failed to Import OVA file from $ovaSourceType" -ForegroundColor red
     Write-Host "StatusCode:" $_.Exception.Response.StatusCode.value__
     Write-Host "StatusDescription:" $_.Exception.Response.StatusDescription
     break
@@ -821,5 +779,68 @@ else {
     Write-Host "You have selected to not deploy vRA" -ForegroundColor Black -BackgroundColor Yellow
 }
 # END Deploy vRA
+
+
+
+###########################################
+# Downsize VIDM to 2 vCPU | 6 GB          #
+# For Testing / Homelab environment only! #
+###########################################
+
+if ($vidmResize -eq $true) {
+    write-host "VIDM VM will be resized to smallest size. Not supported for production environments"  -ForegroundColor Black -BackgroundColor Yellow
+    # Power OFF VIDM via vRSLCM Request
+    $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/globalenvironment/products/vidm/power-off"
+    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header
+    $vidmPowerOffRequestId = $response.requestId
+    # Check VIDM Power OFF Request
+    $uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$vidmPowerOffRequestId"
+    Write-Host "VIDM Power OFF Started at" (get-date -format HH:mm)
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+    $Timeout = 3600
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
+        Start-Sleep -Seconds 60
+        Write-Host "VIDM Power OFF Status at " (get-date -format HH:mm) $response.state
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+        if ($response.state -eq "FAILED"){
+            Write-Host "FAILED to Power OFF VIDM " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
+            Break
+        }
+    }
+    $timer.Stop()
+    Write-Host "VIDM Power OFF Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
+
+    # Resize VIDM
+    Set-VM -vm $vidmVmName -MemoryGB 8 -NumCpu 2 -Confirm:$false
+    $vidmvm = get-vm -Name $vidmVmName
+    Write-Host "VIDM VM Set to " $vidmVm.NumCpu " vCPU and " $vidmVM.MemoryGB " GB Memory" -ForegroundColor Black -BackgroundColor Green
+
+    #Power ON VIDM
+    $uri = "https://$vrslcmHostname/lcm/lcops/api/v2/environments/globalenvironment/products/vidm/power-on"
+    $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $header
+    $vidmPowerOnRequestId = $response.requestId
+    # Check VIDM Power ON Request
+    $uri = "https://$vrslcmHostname/lcm/request/api/v2/requests/$vidmPowerOnRequestId"
+    Write-Host "VIDM Power ON Started at" (get-date -format HH:mm)
+    $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+    $Timeout = 3600
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    while (($timer.Elapsed.TotalSeconds -lt $Timeout) -and (-not ($response.state -eq "COMPLETED"))) {
+        Start-Sleep -Seconds 60
+        Write-Host "VIDM Power ON Status at " (get-date -format HH:mm) $response.state
+        $response = Invoke-RestMethod -Method Get -Uri $uri -Headers $header
+        if ($response.state -eq "FAILED"){
+            Write-Host "FAILED to Power ON VIDM " (get-date -format HH:mm) -ForegroundColor White -BackgroundColor Red
+            Break
+        }
+    }
+    $timer.Stop()
+    Write-Host "VIDM Power ON Status at " (get-date -format HH:mm) $response.state -ForegroundColor Black -BackgroundColor Green
+}
+else {
+    Write-Host "You have selected to not resize VIDM" -ForegroundColor Black -BackgroundColor Yellow
+}
+
 
 DisConnect-VIServer $vCenterServer -Confirm:$false
